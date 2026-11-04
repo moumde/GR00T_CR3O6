@@ -1,0 +1,561 @@
+# GR00T Deployment & Inference Guide
+
+Run inference with PyTorch or TensorRT acceleration for the GR00T N1.7 policy.
+
+---
+
+## Prerequisites
+
+- Model checkpoint: `nvidia/GR00T-N1.7-3B`
+- Dataset in LeRobot format (e.g., `demo_data/libero_demo`)
+- CUDA-enabled GPU
+- Setup uv environment following README.md
+
+| Platform | Installation |
+|----------|-------------|
+| **dGPU** (H100, A100, RTX 4090/5090, L20, RTX Pro 5000/6000, etc.) | `uv sync` — GPU deps (`flash-attn`, `onnx`, `tensorrt`) included |
+| **[Jetson Thor](https://developer.nvidia.com/embedded/jetson)** | [Jetson Thor Setup](#jetson-thor-setup) (Docker or bare metal) |
+| **[DGX Spark](https://developer.nvidia.com/dgx-spark)** | [DGX Spark Setup](#dgx-spark-setup) (Docker or bare metal) |
+| **[Jetson Orin](https://developer.nvidia.com/embedded/jetson)** | [Jetson Orin Setup](#jetson-orin-setup) (Docker or bare metal) |
+
+- dGPU local environment: use the installation commands below, then use the PyTorch or TensorRT commands in this guide
+- Thor Docker or bare metal: skip to [Jetson Thor Setup](#jetson-thor-setup)
+- Spark Docker or bare metal: skip to [DGX Spark Setup](#dgx-spark-setup)
+- Orin Docker or bare metal: skip to [Jetson Orin Setup](#jetson-orin-setup)
+
+### dGPU Installation
+
+```bash
+uv sync
+```
+
+GPU dependencies (`flash-attn`, `onnx`, `tensorrt`) are included in the default install.
+
+## Download Model and Dataset
+
+Download the finetuned model to a local directory (HuggingFace does not support nested repo paths directly):
+
+```bash
+uv run hf download nvidia/GR00T-N1.7-LIBERO \
+  --include "libero_10/config.json" "libero_10/embodiment_id.json" \
+  "libero_10/model-*.safetensors" "libero_10/model.safetensors.index.json" \
+  "libero_10/processor_config.json" "libero_10/statistics.json" \
+  --local-dir checkpoints/GR00T-N1.7-LIBERO
+```
+
+For demo dataset setup, see the [Data Format section in the main README](../../README.md#data-format).
+
+---
+
+## Quick Start: PyTorch Inference
+
+Run inference on demo trajectories using PyTorch (no TRT setup needed):
+
+```bash
+uv run python scripts/deployment/standalone_inference_script.py \
+  --model-path checkpoints/GR00T-N1.7-LIBERO/libero_10 \
+  --dataset-path demo_data/libero_demo \
+  --embodiment-tag LIBERO_PANDA \
+  --traj-ids 0 1 2 3 4 \
+  --inference-mode pytorch \
+  --execution-horizon 8
+```
+
+---
+
+## TensorRT Acceleration
+
+The `trt_full_pipeline` mode (passed via `--inference-mode trt_full_pipeline`
+in `standalone_inference_script.py`) accelerates all model components with
+TRT engines. Speedup varies by platform — see benchmark tables below for
+measured results on each device. The same pipeline is referred to as
+`n17_full_pipeline` inside the engine-loading and build scripts
+(`trt_model_forward.py`, `build_trt_pipeline.py`); the two names describe
+the same set of engines.
+
+| Component | Engine | Notes |
+|-----------|--------|-------|
+| ViT | **TRT** | Qwen3-VL Vision (24 blocks, FP32 for accuracy) |
+| LLM | **TRT** | Qwen3-VL Text Model (16 layers, with deepstack injection) |
+| VL Self-Attention | **TRT** | SelfAttentionTransformer (4 layers, if present) |
+| State Encoder | **TRT** | CategorySpecificMLP |
+| Action Encoder | **TRT** | MultiEmbodimentActionEncoder |
+| DiT | **TRT** | AlternateVLDiT (32 layers) |
+| Action Decoder | **TRT** | CategorySpecificMLP |
+
+Lightweight ops remain in PyTorch: `embed_tokens`, `masked_scatter`, `get_rope_index`, VLLN.
+
+### TRT Export Modes
+
+| Export mode | TRT components | PyTorch components | Typical use |
+|-------------|----------------|--------------------|-------------|
+| `dit_only` | DiT only | Backbone, state encoder, action encoder, action decoder | Legacy path and fallback/debug |
+| `action_head` | State encoder, action encoder, DiT, action decoder | Backbone | Isolate action-head TRT accuracy/performance |
+| `full_pipeline` | Backbone and action head | Lightweight glue ops listed above | Recommended fast path on dGPU, Thor, Spark, and Orin |
+
+<details>
+<summary>DiT-only mode (legacy from N1.6)</summary>
+
+The `dit_only` export mode (`--export-mode dit_only`) optimizes only the action head DiT, leaving the backbone in PyTorch. This was the default in N1.6. For N1.7, **full_pipeline is recommended** as it accelerates the backbone (ViT + LLM) which dominates inference time.
+</details>
+
+### Build TRT Engines
+
+The unified `build_trt_pipeline.py` script runs all steps (export ONNX → build engines → verify accuracy → benchmark) in a single command:
+
+```bash
+uv run python scripts/deployment/build_trt_pipeline.py \
+  --model-path checkpoints/GR00T-N1.7-LIBERO/libero_10 \
+  --dataset-path demo_data/libero_demo \
+  --embodiment-tag LIBERO_PANDA \
+  --flat-e2e
+```
+
+> **Finetuned models:** Replace `--model-path` with your checkpoint path. The pipeline is identical for base and finetuned models.
+
+> **Note:** Engine build takes ~2-5 minutes depending on GPU. Engines are GPU-architecture-specific and must be rebuilt for different GPUs.
+
+> **Batch size:** The `--batch-size` value is baked as a **static** dimension into the ONNX and TRT models. Engines built with one batch size cannot be used with a different batch size at runtime. If you need a different batch size, re-run the full pipeline (`--steps export,build,verify`) with the new `--batch-size` value.
+
+> **ONNX exporter:** The baseline N1.7 TRT export path uses PyTorch's legacy ONNX exporter explicitly (`dynamo=False`) for all components. Keep this explicit in custom export code as well: the dynamo exporter can specialize dynamic sequence dimensions such as `vl_seq_len`, which breaks TensorRT runtime flexibility for different token lengths.
+
+You can also run a subset of steps:
+
+```bash
+# Export + build only (skip verify and benchmark)
+uv run python scripts/deployment/build_trt_pipeline.py \
+  --model-path checkpoints/GR00T-N1.7-LIBERO/libero_10 \
+  --dataset-path demo_data/libero_demo \
+  --embodiment-tag LIBERO_PANDA \
+  --steps export,build
+```
+
+<details>
+<summary>What each step does</summary>
+
+The pipeline runs 4 steps in sequence:
+
+1. **Export to ONNX** (`export`) — Exports all model components (LLM, VL Self-Attention, State Encoder, Action Encoder, DiT, Action Decoder) to ONNX format under `<output-dir>/onnx/`.
+2. **Build TensorRT Engines** (`build`) — Compiles each ONNX model into a GPU-specific TensorRT engine under `<output-dir>/engines/`.
+3. **Verify Accuracy** (`verify`) — Runs PyTorch vs TRT output comparison. Expected: `Cosine Similarity: 0.999+` (PASS).
+4. **Benchmark** (`benchmark`) — Measures E2E latency for PyTorch Eager, torch.compile, and TRT modes.
+
+Each step can be run individually via `--steps <step>`. Verbose logs are written to `<output-dir>/pipeline.log`.
+</details>
+
+---
+
+### Optional Thor quantization and execution optimization
+
+The [Jetson AI Lab recipe](https://www.jetson-ai-lab.com/tutorials/groot_n17_on_thor/)
+adds `--execution-profile optimized` (cross-attention K/V caching, projection
+fusion, and CUDA graphs) and `--quantization fp8|mixed_nvfp4`. Baseline execution
+and unquantized BF16 remain the defaults. Optimized execution requires
+`--export-mode action_head` or `full_pipeline` (the default).
+
+The Thor installer includes the quantization dependencies.
+
+```bash
+python scripts/deployment/build_trt_pipeline.py \
+  --model-path checkpoints/GR00T-N1.7-LIBERO/libero_10 \
+  --dataset-path demo_data/libero_demo --embodiment-tag LIBERO_PANDA \
+  --output-dir gr00t_trt_optimized_mixed_nvfp4 --batch-size 1 \
+  --execution-profile optimized --quantization mixed_nvfp4 \
+  --calib-dataset-path demo_data/libero_demo --calib-size 10
+```
+
+Use representative calibration observations from the target embodiment.
+ModelOpt is required only for quantization. Build the baseline and optimized
+engines in separate output directories with the same checkpoint, inputs, and
+software stack. Standalone `trt_full_pipeline` inference reads the profile and
+precision from the selected engine directory's metadata; select it with
+`--trt-engine-path gr00t_trt_optimized_mixed_nvfp4/engines`.
+
+## Performance
+
+### Benchmark Results
+
+These refreshed measurements report the median synchronized complete local policy
+call, including preprocessing and action decoding, excluding RPC. Each run uses
+the full N1.7 LIBERO `libero_10` checkpoint (32 DiT blocks), `LIBERO_PANDA`, batch
+size 1, action horizon 40, four denoising steps, and the same episode-zero/step-zero
+observation: `image` and `wrist_image`, each 256×256, producing 156 VLM tokens.
+Each backend uses 10 untimed warmups and 20 timed calls per repetition, seed 42,
+and disabled cuDNN autotuning. All six devices report the median of 60 calls
+pooled across three independent repetitions for eager, compile and baseline TRT.
+Thor has a separate 20-call mixed NVFP4 series. `torch.compile` compiles the DiT
+action head with `max-autotune` on every device; the backbone remains eager.
+
+Values below are milliseconds for the complete call. Previous numbers obtained
+by summing component timings have been removed from this comparison.
+
+| Device | PyTorch eager | torch.compile | TensorRT full pipeline | TensorRT optimized + mixed NVFP4 |
+|--------|---------------|---------------|------------------------|---------------------------------|
+| H100 80GB HBM3 | 101.5 | 53.4 | 22.9 | — |
+| RTX Pro 6000 Blackwell Server Edition (96 GB) | 75.7 | 52.1 | 24.7 | — |
+| L40 | 123.7 | 66.8 | 35.0 | — |
+| DGX Spark | 200.8 | 183.1 | 116.6 | — |
+| AGX Thor (120 W) | 111.5 | 100.5 | 77.6 | 35.9 |
+| Jetson Orin (30 W) | 500.1 | 412.4 | 312.2 | — |
+
+All devices use eight PyTorch CPU threads and one interop thread. Effective CPU
+quotas are 12 cores for H100/L40/Spark/Thor and 8 cores for RTX/Orin. Thor 120 W
+and Orin 30 W were measured with `jetson_clocks` enabled: CPU, GPU and memory
+clocks fixed at the maxima allowed by those power modes. MAXN was not compared.
+All TRT rows passed the existing 0.99 final-action cosine threshold; this does
+not measure closed-loop task success.
+
+To select the same complete-policy-call measurement used above, benchmark the
+already-built, device-specific engines with `--flat-e2e` and replay the same
+frozen raw observation on every device:
+
+```bash
+uv run python scripts/deployment/build_trt_pipeline.py \
+  --model-path checkpoints/GR00T-N1.7-LIBERO/libero_10 \
+  --dataset-path demo_data/libero_demo \
+  --embodiment-tag LIBERO_PANDA \
+  --output-dir ./gr00t_trt_deployment \
+  --steps benchmark \
+  --flat-e2e \
+  --observation-path /absolute/path/to/canonical-observation.npz \
+  --warmup 10 \
+  --num-iterations 20
+```
+
+`--observation-path` accepts a NumPy NPZ containing the raw observation arrays
+under `observation.video.<camera>`, `observation.state.<key>` and
+`observation.language.<key>`. Supply the same saved episode-zero/step-zero NPZ
+on each device; keys, shapes and dtypes must match the checkpoint's dataset
+modalities. Language arrays must use the matching NumPy string dtype, not
+pickled objects. Cached `processed.*` arrays are ignored: preprocessing runs
+inside each timed policy call. The frozen NPZ is a separately supplied input,
+not included in this repository. A newly decoded or different observation does
+not establish an identical-input reproduction of the published table.
+
+Repeat the command three times and pool the 60 raw complete-call samples per
+backend, with the model, runtime, CPU and power/clock configuration above.
+Without `--flat-e2e`, the benchmark retains its component-timing default and
+sums independently measured components; those results are not comparable to
+this table. `--observation-path` cannot be combined with trajectory timing.
+
+### Standalone Inference with TRT
+
+The standalone inference script serves as both an accuracy validation and a reference for deploying TRT inference in your own code. It runs per-step inference on real trajectories and compares action predictions:
+
+```bash
+uv run python scripts/deployment/standalone_inference_script.py \
+  --model-path checkpoints/GR00T-N1.7-LIBERO/libero_10 \
+  --dataset-path demo_data/libero_demo \
+  --embodiment-tag LIBERO_PANDA \
+  --traj-ids 0 1 2 3 4 \
+  --inference-mode trt_full_pipeline \
+  --trt-engine-path ./gr00t_trt_deployment/engines \
+  --save-plot-path ./output/trt_inference.png
+```
+
+Expected accuracy: MSE/MAE match PyTorch within noise. TRT produces identical action quality. Speedup varies by platform — run `build_trt_pipeline.py --steps benchmark --flat-e2e` on your hardware for exact numbers.
+
+### Optional: LIBERO Closed-Loop Sim Evaluation
+
+To validate TRT accuracy in end-to-end robotic tasks, run the LIBERO closed-loop evaluation. This requires a separate environment setup (~10-30 min, MuJoCo simulator + dependencies).
+
+<details>
+<summary>Setup, commands, and results (H100, 20 episodes)</summary>
+
+Task: `KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it`, 20 episodes:
+
+| Mode | Success Rate |
+|------|-------------|
+| PyTorch | 100% (20/20) |
+| TRT (n17_full_pipeline) | 95% (19/20) |
+
+Difference is within simulation noise (p >> 0.05).
+
+> **Note:** Use `--n-envs 1` for TRT evaluation (ViT engine has static shapes for single-observation inference).
+
+```bash
+# One-time LIBERO setup (~10 min)
+bash gr00t/eval/sim/LIBERO/setup_libero.sh
+
+# Activate LIBERO venv and install additional deps
+source gr00t/eval/sim/LIBERO/libero_uv/.venv/bin/activate
+uv pip install diffusers transformers accelerate safetensors torchcodec
+
+# TRT full pipeline evaluation
+python gr00t/eval/rollout_policy.py \
+  --model-path checkpoints/GR00T-N1.7-LIBERO/libero_10 \
+  --env-name "libero_sim/KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it" \
+  --n-episodes 20 --n-envs 1 --max-episode-steps 504 \
+  --trt-engine-path ./gr00t_trt_deployment/engines \
+  --trt-mode n17_full_pipeline
+```
+</details>
+
+> Run `python scripts/deployment/build_trt_pipeline.py --steps benchmark --flat-e2e` to generate benchmarks for your hardware.
+
+---
+
+## Platform-Specific Setup
+
+> Jetson and Spark platforms use different dependency stacks than dGPU. Thor and Orin use JetPack 7.2 / CUDA 13.2 with PyTorch 2.13.0 from the [PyTorch cu132 index](https://download.pytorch.org/whl/cu132). Spark uses CUDA 13.0 with PyTorch 2.10.0 from the [Jetson AI Lab cu130 index](https://pypi.jetson-ai-lab.io/sbsa/cu130).
+
+> ⚠️ **aarch64 users (Spark / Thor / Orin):** After running `install_deps.sh`, always
+> activate the venv with `source .venv/bin/activate && source scripts/activate_<platform>.sh`
+> (`activate_spark.sh`, `activate_thor.sh`, or `activate_orin.sh`) and run the example
+> commands with **plain `python`** / `torchrun`, not `uv run python` / `uv run torchrun` —
+> the latter re-syncs against the root `pyproject.toml` (x86_64 Python 3.12) and destroys
+> the platform-specific environment. This applies to every platform below; see also the
+> [aarch64 note in the main README](../../README.md#set-up-the-environment).
+
+### Shared Docker Workflow
+
+The Docker steps below are identical across Thor, Spark, and Orin except the image tag
+(`gr00t-thor`, `gr00t-spark`, or `gr00t-orin`). Each platform section builds its image, then
+reuses these steps:
+
+1. **Download the model** once on the host — see [Download Model and Dataset](#download-model-and-dataset).
+2. **Start an interactive session** (replace `<profile>` with `thor`, `spark`, or `orin`):
+
+```bash
+docker run -it --rm --runtime nvidia --gpus all \
+  --ipc=host \
+  --ulimit memlock=-1 \
+  --ulimit stack=67108864 \
+  --network host \
+  -v "$(pwd)":/workspace/repo \
+  -v "${HF_HOME:-${HOME}/.cache/huggingface}":/root/.cache/huggingface \
+  -w /workspace/repo \
+  -e HF_TOKEN="${HF_TOKEN:-}" \
+  gr00t-<profile> \
+  bash
+```
+
+Then run the platform's TRT pipeline command inside the container (shown per platform below).
+
+### Jetson Thor Setup
+
+Thor uses JetPack 7.2 / Jetson Linux 39.2, CUDA 13.2, Python 3.12, and
+PyTorch 2.13.0 from the PyTorch cu132 index. Older JetPack releases are no
+longer supported. Thor and Orin share one CUDA 13.2 / PyTorch 2.13.0
+`flash-attn` wheel containing both `sm_87` and `sm_110` kernels. The installer
+builds it when a local or cached wheel is unavailable.
+There are two ways to run on Thor: Docker (recommended) or bare metal.
+
+<details>
+<summary><strong>Docker (Recommended)</strong></summary>
+
+Build the Thor container from the repo root:
+
+```bash
+cd docker && bash build.sh --profile=thor && cd ..
+```
+
+Then follow the [Shared Docker Workflow](#shared-docker-workflow) (image `gr00t-thor`) to download the model and start the container. Inside the container, run the full TRT pipeline (export, build, verify, benchmark):
+
+```bash
+python scripts/deployment/build_trt_pipeline.py \
+  --model-path checkpoints/GR00T-N1.7-LIBERO/libero_10 \
+  --dataset-path demo_data/libero_demo \
+  --embodiment-tag LIBERO_PANDA \
+  --flat-e2e
+```
+</details>
+
+<details>
+<summary><strong>Bare Metal</strong></summary>
+
+```bash
+# One-time install (validates JetPack 7.x/R39, installs FFmpeg, uv, CUDA 13.2
+# dev packages when needed, Python deps, and a source-built flash-attn wheel)
+bash scripts/deployment/thor/install_deps.sh
+
+# In each new shell
+source .venv/bin/activate
+source scripts/activate_thor.sh
+```
+
+Then run the TRT pipeline or PyTorch inference as shown in the [TensorRT Acceleration](#tensorrt-acceleration) and [Quick Start](#quick-start-pytorch-inference) sections above.
+The activation script exports the PyTorch and CUDA library/include paths that `torchcodec`
+and `torch.compile` need on Thor.
+If you later run `uv sync`, rerun the Thor installer to restore the locally built wheel.
+</details>
+
+---
+
+### DGX Spark Setup
+
+Spark uses CUDA 13 and Python 3.12 like Thor, but requires a dedicated dependency stack and
+source-built `flash-attn` for `sm121`. TensorRT is pinned to 10.16.1.11 because
+10.15.1 fails to compile the optimized Action Encoder at batch size 2. There are two ways
+to run on Spark: Docker (recommended) or bare metal.
+
+<details>
+<summary><strong>Docker (Recommended)</strong></summary>
+
+Build the Spark container from the repo root:
+
+```bash
+cd docker && bash build.sh --profile=spark && cd ..
+```
+
+Then follow the [Shared Docker Workflow](#shared-docker-workflow) (image `gr00t-spark`) to download the model and start the container. Inside the container, run the full TRT pipeline (export, build, verify, benchmark):
+
+```bash
+python scripts/deployment/build_trt_pipeline.py \
+  --model-path checkpoints/GR00T-N1.7-LIBERO/libero_10 \
+  --dataset-path demo_data/libero_demo \
+  --embodiment-tag LIBERO_PANDA \
+  --flat-e2e
+```
+</details>
+
+<details>
+<summary><strong>Bare Metal</strong></summary>
+
+```bash
+# One-time install (installs NVPL libs, uv, Python deps, source-builds flash-attn for sm121, and builds
+# torchcodec from source against the system FFmpeg runtime)
+bash scripts/deployment/spark/install_deps.sh
+
+# In each new shell
+source .venv/bin/activate
+source scripts/activate_spark.sh
+```
+
+Then run the TRT pipeline or PyTorch inference as shown in the [TensorRT Acceleration](#tensorrt-acceleration) and [Quick Start](#quick-start-pytorch-inference) sections above.
+If you later rerun `uv sync`, rerun `bash scripts/deployment/spark/install_deps.sh` so the
+Spark-specific `flash-attn` build is restored and revalidated.
+</details>
+
+---
+
+### Jetson Orin Setup
+
+Orin uses JetPack 7.2 / Jetson Linux 39.2, CUDA 13.2, Python 3.12, and PyTorch 2.13.0 from the PyTorch cu132 index. JetPack 6.x / Jetson Linux R36 is no longer supported. Orin and Thor share one CUDA 13.2 / PyTorch 2.13.0 `flash-attn` wheel containing both `sm_87` and `sm_110` kernels; the installer builds it when a local or cached wheel is unavailable.
+There are two ways to run on Orin: Docker (recommended) or bare metal.
+
+<details>
+<summary><strong>Docker (Recommended)</strong></summary>
+
+Build the Orin container from the repo root:
+
+```bash
+cd docker && bash build.sh --profile=orin && cd ..
+```
+
+Then follow the [Shared Docker Workflow](#shared-docker-workflow) (image `gr00t-orin`) to download the model and start the container. Inside the container, run the full TRT pipeline (export, build, verify, benchmark):
+
+```bash
+python scripts/deployment/build_trt_pipeline.py \
+  --model-path checkpoints/GR00T-N1.7-LIBERO/libero_10 \
+  --dataset-path demo_data/libero_demo \
+  --embodiment-tag LIBERO_PANDA \
+  --flat-e2e
+```
+</details>
+
+<details>
+<summary><strong>Bare Metal</strong></summary>
+
+```bash
+# One-time install (validates JetPack 7.x/R39, installs FFmpeg, uv, CUDA 13.2
+# dev packages when needed, Python deps, and a source-built flash-attn wheel)
+bash scripts/deployment/orin/install_deps.sh
+
+# In each new shell
+source .venv/bin/activate
+source scripts/activate_orin.sh
+```
+
+Then run the TRT pipeline or PyTorch inference as shown in the [TensorRT Acceleration](#tensorrt-acceleration) and [Quick Start](#quick-start-pytorch-inference) sections above.
+The activation script exports the PyTorch and CUDA library/include paths that `torchcodec`
+and `torch.compile` need on Orin.
+If you later run `uv sync`, rerun the Orin installer to restore the locally built wheel.
+</details>
+
+> **Orin storage tip:** If your eMMC root is low on space, redirect the HuggingFace cache to an NVMe SSD with `export HF_HOME=/path/to/ssd/.cache/huggingface` before downloading models.
+
+---
+
+## Command-Line Arguments
+
+### `build_trt_pipeline.py`
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--model-path` | (required) | Path to model checkpoint |
+| `--dataset-path` | `demo_data/libero_demo` | Path to dataset (LeRobot format) |
+| `--embodiment-tag` | Auto-detected | Embodiment tag (auto-detected from processor_config.json if single embodiment) |
+| `--output-dir` | `./gr00t_trt_deployment` | Root output directory. ONNX → `<output-dir>/onnx/`, engines → `<output-dir>/engines/` |
+| `--precision` | `bf16` | Precision for ONNX export and TRT engine build (`bf16` only) |
+| `--batch-size` | `1` | Batch size baked into exported ONNX/TRT models (static — see note below) |
+| `--export-mode` | `full_pipeline` | Export mode: `dit_only`, `action_head`, or `full_pipeline` |
+| `--workspace` | `8192` | TRT builder workspace size in MB |
+| `--num-iterations` | `20` | Number of benchmark iterations |
+| `--flat-e2e` | `false` | Time synchronized complete policy calls, including preprocessing and action decoding; required for comparison with the table |
+| `--observation-path` | None | Frozen raw observation NPZ to replay identical inputs across devices |
+| `--warmup` | `5` | Number of warmup iterations |
+| `--skip-compile` | `false` | Skip torch.compile benchmark |
+| `--steps` | `all` | Steps to run: `all` or comma-separated subset of `export,build,verify,benchmark` |
+| `--log-file` | `<output-dir>/pipeline.log` | Log file path |
+
+### `standalone_inference_script.py`
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--model-path` | (required) | Path to model checkpoint |
+| `--dataset-path` | `demo_data/droid_sample` | Path to dataset (LeRobot format) |
+| `--embodiment-tag` | `OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT` | Robot embodiment tag |
+| `--traj-ids` | `[0]` | Episode indices to evaluate (space-separated) |
+| `--steps` | `200` | Max steps per trajectory (capped by actual length) |
+| `--execution-horizon` | `16` | Steps of each predicted chunk to execute per inference (old `--action-horizon` deprecated) |
+| `--inference-mode` | `pytorch` | `pytorch`, `tensorrt` (DiT-only TRT), or `trt_full_pipeline` (all engines) |
+| `--trt-engine-path` | `./gr00t_trt_deployment/engines` | Directory containing pre-built TRT engines (matches `build_trt_pipeline.py` output) |
+| `--denoising-steps` | `4` | Diffusion denoising iterations |
+| `--save-plot-path` | `None` | Save per-trajectory GT-vs-predicted comparison plots |
+| `--skip-timing-steps` | `1` | Initial steps excluded from timing stats (warmup) |
+| `--host` / `--port` | `127.0.0.1` / `5555` | Server address (when using client mode without `--model-path`) |
+| `--seed` | `42` | Random seed for reproducibility |
+
+## Files
+
+TensorRT implementations live under `trt/`. Run these commands from the repository
+root with `python -m scripts.deployment.trt.<module>`. The N1.7 exporter and runtime
+include their optimized paths. Calibration and
+shared precision/artifact configuration remain separate modules.
+
+| File | Description |
+|------|-------------|
+| `trt/export_onnx_n1d7.py` | N1.7 component ONNX export, including optimized graph transformations |
+| `trt/build_tensorrt_engine.py` | TensorRT engine construction |
+| `trt/verify_n1d7_trt.py` | PyTorch/TensorRT action equivalence checks |
+| `trt/_trt_contract.py` | Shared engine metadata and workload validation |
+| `build_trt_pipeline.py` | Unified pipeline: export ONNX, build engines, verify, benchmark |
+| `standalone_inference_script.py` | Main inference script (PyTorch + DiT-only or full-pipeline TensorRT) |
+| `trt/trt_torch.py` | TRT Engine wrapper class (load, bind, execute) |
+| `trt/trt_model_forward.py` | TRT forward functions and setup, including optimized action-head CUDA graphs |
+| `trt/n1d7_optimization_config.py` | Shared precision recipes and optimized artifact contracts |
+| `trt/n1d7_calibration.py` | FP8/NVFP4 calibration and recipe validation |
+
+---
+
+## Troubleshooting
+
+### Engine Build Fails
+
+- Ensure you have enough GPU memory (16GB+ recommended for full pipeline)
+- Try reducing workspace size: `--workspace 4096`
+- Ensure TensorRT version matches your CUDA version
+- LLM engine requires `batch_size` dimension handling when using custom shape profiles
+
+### ONNX Export Issues
+
+- If export fails with COMPLEX128 error: ensure `_simple_causal_mask` is used (not HuggingFace's `create_causal_mask`)
+- If `masked_scatter` size assertion fails: ensure `visual_pos_masks` has the correct number of True values matching deepstack tensor size
+- Check that the dataset path is valid and contains at least one trajectory
+
+### Accuracy Issues
+
+- If cosine < 0.99: check that LLM export does NOT include the final RMSNorm (backbone returns pre-norm `hidden_states[-1]`)
+- If output magnitude is ~12x too small: this is the norm bug — see above
+- Run `build_trt_pipeline.py --steps verify --export-mode action_head` first to isolate backbone vs action head drift

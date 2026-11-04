@@ -1,0 +1,59 @@
+{
+  "contract_version": "customer-api-v1",
+  "mode": "shadow",
+  "robot_execution_enabled": false,
+  "cameras": [
+    "top",
+    "wrist",
+    "side"
+  ],
+  "image_shape": [
+    224,
+    224,
+    3
+  ],
+  "image_encoding": "base64_png_rgb",
+  "state_names": [
+    "cr3.q1.rad",
+    "cr3.q2.rad",
+    "cr3.q3.rad",
+    "cr3.q4.rad",
+    "cr3.q5.rad",
+    "cr3.q6.rad",
+    "o6.thumb_flex.position",
+    "o6.thumb_yaw.position",
+    "o6.index_flex.position",
+    "o6.middle_flex.position",
+    "o6.ring_flex.position",
+    "o6.little_flex.position"
+  ],
+  "action_names": [
+    "cr3.target_q1.rad",
+    "cr3.target_q2.rad",
+    "cr3.target_q3.rad",
+    "cr3.target_q4.rad",
+    "cr3.target_q5.rad",
+    "cr3.target_q6.rad",
+    "o6.thumb_flex.command",
+    "o6.thumb_yaw.command",
+    "o6.index_flex.command",
+    "o6.middle_flex.command",
+    "o6.ring_flex.command",
+    "o6.little_flex.command"
+  ],
+  "action_shape": [
+    16,
+    12
+  ],
+  "fixed_zero_channels": [
+    9,
+    10,
+    11
+  ],
+  "arm_units": "radians_absolute_joint_target",
+  "hand_units": "original_raw_command",
+  "dt_seconds": 0.05,
+  "task": "Pick up the motor and place it on the right side with the protruding side facing left.",
+  "ready": true,
+  "expires_utc": "2026-10-21T03:44:16.263218+00:00"
+}
